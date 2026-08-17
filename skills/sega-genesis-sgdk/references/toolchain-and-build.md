@@ -53,8 +53,13 @@ Key facts that make this work (all verified):
   produces valid Genesis code. `-m68000` selects the CPU (default is 68020+).
 - Ubuntu's `gcc-m68k-linux-gnu` is **GCC 13.x**, matching SGDK 2.12's GCC 13.2 —
   the closer the versions, the fewer surprises (see the LTO warning below).
-- `libgcc.a` for this toolchain has the 68000 helpers SGDK needs
-  (`__mulsi3`, `__udivsi3`, `__divsi3`) — the 68000 has no 32-bit multiply/divide.
+- ⚠️ **Debian's `libgcc.a` is built for 68020+**, so even though it contains the
+  helpers the 68000 needs (`__mulsi3`, `__udivsi3`, `__divsi3` — the 68000 has no
+  32-bit multiply/divide), some use instructions the base 68000 lacks (e.g.
+  `__divsi3` via 32-bit `bsr.l`), which trap as an illegal/line-F exception on
+  real hardware and accurate emulators. **Link SGDK's shipped 68000-safe
+  `$GDK/lib/libgcc.a` explicitly** instead of `-lgcc` — put it *after* `libmd.a`
+  on the link line. (This is verified from a real port that crashed until it did.)
 - SGDK's tool prefix is `m68k-elf-`. Create symlinks so its makefiles and the
   `-B$(BIN)` mechanism find your tools:
   ```sh
@@ -156,7 +161,7 @@ m68k-elf-gcc $AFLAGS -c build/sega.s -o build/sega.o
 # 5) link with md.ld + library, then raw binary + pad + checksum
 m68k-elf-gcc -m68000 -n -T "$GDK/md.ld" -nostdlib -Wl,--build-id=none \
   build/sega.o build/main.o build/game.o build/resources.o \
-  "$GDK/lib/libmd.a" -lgcc -o build/rom.out -Wl,--gc-sections
+  "$GDK/lib/libmd.a" "$GDK/lib/libgcc.a" -o build/rom.out -Wl,--gc-sections
 m68k-elf-objcopy -O binary build/rom.out out/rom.bin
 java -jar "$GDK/bin/sizebnd.jar" out/rom.bin -sizealign 131072 -checksum
 ```
@@ -171,7 +176,10 @@ Non-obvious gotchas this sequence encodes:
 - **`.data`/`.bss` VMA is `0xE0FF0000`** in `md.ld` (masks to `0x00FF0000` work
   RAM on the 24-bit bus). `_start_entry` in libmd copies `.data` and clears RAM
   before `main` — this is why a *matching* library matters (see LTO trap).
-- **`-lgcc`** must be on the link line for the 68000 mul/div helpers.
+- **A 68000-safe `libgcc`** must be on the link line for the mul/div helpers —
+  prefer SGDK's shipped `$GDK/lib/libgcc.a` over the Debian toolchain's `-lgcc`
+  (the latter is 68020+ and can emit instructions that trap on a 68000; see the
+  apt-route warning above).
 - The `AFLAGS` for `.s`/`.s80`-derived asm need
   `--register-prefix-optional,--bitwise-or` or SGDK's assembly won't assemble.
 

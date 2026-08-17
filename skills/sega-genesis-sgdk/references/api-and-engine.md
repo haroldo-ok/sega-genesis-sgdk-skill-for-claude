@@ -180,6 +180,18 @@ Use SGDK fixed-point in physics/geometry: `F16` is 10.6, `F32` is 16.16 (see
 `F16_computePosition(...)` helpers. Never use `float` in hot paths — there's no
 FPU, and softfloat is huge and slow.
 
+> ⚠️ **Odd-address word-load trap with *custom* fixed-point.** If you roll your
+> own 8.8/16.16 in a 32-bit field and extract the integer part as
+> `(s16)(v >> 8)` where `v` is a **memory operand**, modern GCC (14+) can compile
+> that into a word load from an *odd* address — legal on 68020+, but an **address
+> error (crash)** on the base 68000. It runs fine in some emulators and traps on
+> accurate ones / real hardware, so it's easy to miss. Fix: force the shifted
+> value through a data register before the narrowing cast — e.g. a tiny
+> `static inline s16 fromfp(s32 v){ return (s16)(v >> 8); }` used everywhere
+> instead of the inline expression. (Verified from a real port that crashed until
+> it did this.) SGDK's own `F16/F32` helpers avoid the pattern; the trap is
+> specific to hand-rolled fixed-point on raw struct fields.
+
 ## Performance playbook
 
 - Decouple logic from render: accumulate frames, tick logic at the source

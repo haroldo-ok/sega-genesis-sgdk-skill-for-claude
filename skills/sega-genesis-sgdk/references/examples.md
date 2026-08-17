@@ -32,6 +32,8 @@ All at `https://github.com/haroldo-ok/<name>`.
   `jazz-jackrabbit-for-sega-genesis`, `god-of-thunder-genesis`. Streaming maps,
   entity pools, converted original assets, host + emulator tests.
 - **Pseudo-3D / effects (hard — performance-critical):** `fzero-clone-md`.
+- **Streaming FMV (hard — DMA-budget-critical):** `hexgl-fmv-md` — video-as-
+  gameplay with a headless capture pipeline.
 - **Audio tooling:** `convert-s3m-vgm-jazzjackrabbit-md`.
 
 ## By technique
@@ -95,6 +97,19 @@ when a port ships `.s3m`/`.mod`/OPL music instead of VGM and you need a
 re-runnable conversion step feeding a `.res` `XGM2`/`XGM` line. Pairs with
 `references/audio.md`.
 
+### `hexgl-fmv-md` — streaming FMV as gameplay
+A prototype that plays a recording of BKcore's WebGL *HexGL* racing track as ROM
+video across two alternating 640-tile VRAM banks while a player-controlled ship
+steers over it as a hardware sprite. The value is the **inter-frame delta
+encoding**: each frame stores only runs of 8×8 tiles that changed vs the frame
+already in its hidden bank (N−2), so one section DMAs straight from ROM per
+VBlank with no full-frame copy and no CPU decode — a *higher* frame rate (15 fps
+NTSC) at a *smaller* ROM (2.875 MB, ~79% of raw). The ship poses are true 3D
+renders of HexGL's Feisar mesh through a matched chase camera at fixed scale, and
+there's a headless capture→convert→encode pipeline plus the two-tier test
+harness. Full write-up in Part 2 → *FMV / video*; **non-commercial** asset
+licensing caveat noted there.
+
 ---
 
 # Part 2 — community index
@@ -141,6 +156,21 @@ technique references, not drop-in libraries.
   full small games in varied styles to compare structure.
 
 ### Shmups / arcade
+- `haroldo-ok/llamatron-md` — a **twin-stick arena shooter** (Robotron/Llamatron
+  style) **built with this very skill**, so it's a faithful worked example of the
+  whole workflow: a platform-clean `src/core/` (host-testable, 8.8 fixed-point)
+  under an SGDK `src/main.c` shell, generated 16-colour sprite art
+  (`tools/gen_art.py`), PSG sound effects, battery **SRAM high-score**, and the
+  full two-tier host + Genesis-Plus-GX harness (21 host-oracle checks + a scripted
+  emulator playthrough). Nice touches: twin-stick on a one-stick pad via a
+  **hold-A aim-lock** (plus true dual-stick on pad 2), and a clean-room reimplementation of
+  a 68000-assembly framebuffer original as VDP sprite gameplay. Its "porting
+  notes" are independent field-confirmation of the skill's toolchain/68000
+  gotchas — `-Wl,--build-id=none`, the LTO trap, linking SGDK's 68000-safe
+  `libgcc.a` over Debian's 68020+ one, and the odd-address 8.8-fixed-point read
+  fixed by forcing the value through a data register (all already in
+  `references/toolchain-and-build.md` and `references/api-and-engine.md`). A
+  strong template for any Robotron-like.
 - `devpow112/quantum-burst` — a **bullet-hell** shooter with a real CI/release
   setup (license/release badges, GitHub Actions); good build-automation model.
 - `sixteenbits/TownQuest` — a game-jam (Almería 2019) MegaDrive game; compact,
@@ -190,6 +220,40 @@ technique references, not drop-in libraries.
   the README notes it pays off beyond ~20 sprites (below that, plain AABB wins).
 
 ### FMV / video
+- `haroldo-ok/hexgl-fmv-md` — **FMV as *gameplay*, not just cutscene**: streams a
+  recording of BKcore's WebGL *HexGL* Cityscape track (256×160, 180 frames, one
+  ~18 s lap, 15 colors/frame) as ROM video across two alternating 640-tile VRAM
+  banks while a player-controlled Feisar ship steers over it as a hardware
+  sprite. Two techniques make it the reference for video-on-a-cart:
+  - **Inter-frame delta encoding (the headline trick).** `tools/encode_delta.py`
+    compares frame N against **N−2** — the frame already sitting in its hidden
+    VRAM bank — and stores only contiguous *runs of changed 8×8 tiles*, split
+    into four independent 160-tile sections. At runtime one section is **DMAed
+    straight from ROM per VBlank**; unchanged tiles just stay in the hidden bank,
+    so there is **no full-frame copy and no CPU pixel decompression**. The result
+    is a *higher* frame rate at a *smaller* ROM: ~79% of the raw stream, stable
+    **15 fps NTSC** (a new frame every 4 hardware frames), 2.875 MB down from
+    3.625 MB, and it retired an earlier 40 KB RAM delta-buffer entirely (only
+    VRAM holds the two reconstructed frames). This is the pattern to copy for any
+    large streamed media on Genesis.
+  - **Genuine 3D ship poses, not rotated 2D.** `tools/render_chase_ship.py` poses
+    the *original* Feisar mesh in Three.js under a camera that recreates HexGL's
+    `CameraChase` (FOV 70°, matched offsets/look-ahead) and renders five steering
+    poses, all through the **same camera and a fixed 128×96 crop → 64×48 resize**
+    so silhouette/perspective change naturally while projection scale stays
+    constant — no per-pose 2D rescaling.
+  Ships a real headless **capture→convert→encode pipeline**
+  (`tools/capture_hexgl.py` drives the original WebGL game via Selenium/Chromium
+  along a centerline from HexGL's own collision map → `convert_assets.py`
+  letterboxes/quantizes → `encode_delta.py` produces the cart stream) plus the
+  two-tier host + Genesis-Plus-GX harness (a cadence test asserts 15/15
+  four-frame intervals each carry a new FMV frame; a fixed-scale sprite
+  regression check). A feasibility slice (one on-track lap, throttle + bounded
+  ±28 px lane steering, no collision branches, no sound); its "current
+  limitations" are a good spec for a production FMV racer (synchronized
+  left/center/right branch clips, H-blank palette bands, streamed audio within
+  the Z80/VDP DMA budget). **Licensing caveat:** HexGL assets are partly
+  CC BY-NC 3.0 — treat as **non-commercial** unless rights are cleared.
 - `matthewbennion/SGDKCodeForFMV` — plays **video built from PNG frames**; the
   code side of a full-motion-video cutscene.
 - `fabri1983/sgdk-video-player` — a **video converter + player** (Java tool +

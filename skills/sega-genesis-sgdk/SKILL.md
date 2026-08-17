@@ -176,8 +176,14 @@ When a ROM compiles but shows black (or a frozen title), check in this order
 6. **DMA queue overflow in one frame** — too many/too-large transfers queued;
    split across frames or raise the queue size.
 7. **Crash → red error screen or reset loop** — a bad pointer / odd-address
-   access. Build `make debug` and read the address-error dump; check ROM-array
-   bounds and struct sizes (`sizeof` on target vs host).
+   access, or a 68020+-only instruction on the 68000. Build `make debug` and read
+   the address-error dump. Two recurring, easy-to-miss causes: (a) **odd-address
+   word load** from a custom fixed-point read like `(s16)(mem32 >> 8)` — GCC 14+
+   emits a word load at an odd address, fine on 68020 but a crash on 68000; route
+   the value through a data register (a `fromfp()` inline). (b) **68020+ libgcc**
+   — Debian's `-lgcc` `__divsi3` uses `bsr.l`, illegal on 68000; link SGDK's
+   shipped `lib/libgcc.a` instead. Also check ROM-array bounds and host-vs-target
+   `sizeof`.
 
 **Distinct failure — "renders but frozen, RAM writes dead":** the ROM boots and
 draws, *background* tiles even update, but **sprites never move and game state

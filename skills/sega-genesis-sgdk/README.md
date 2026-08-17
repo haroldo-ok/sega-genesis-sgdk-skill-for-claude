@@ -5,11 +5,21 @@ Genesis / Mega Drive** games in **C with [SGDK](https://github.com/Stephane-D/SG
 (Stéphane Dallongeville's Sega Genesis Development Kit).
 
 It turns a game — a new idea or an existing port target — into a *playable,
-verified* `out/rom.bin`, and it knows how to get past the number-one SGDK
-failure: a ROM that compiles cleanly but **boots to a black screen**.
+verified* `out/rom.bin`. It knows how to stand up a toolchain even in a locked-
+down environment, how to get past the number-one SGDK failure (a ROM that
+compiles cleanly but **boots to a black screen**), and how to prove the result
+actually runs on emulated hardware instead of stopping at "it compiled."
 
 Written against **SGDK 2.x** (2.12 / GCC 13.2 at time of writing) targeting the
-Motorola 68000 (`m68k-elf-gcc`), the VDP, and the Z80 + YM2612 + PSG sound path.
+Motorola 68000, the VDP, and the Z80 + YM2612 + PSG sound path.
+
+> **Proven end-to-end.** Every capability below — the toolchain setup, the build
+> pipeline, the headless-emulator harness, and the debugging playbook — was used
+> to take an original maze-chase game from an empty folder to a **booting,
+> playable ROM verified in Genesis Plus GX** (muncher moving under joypad
+> control, score rising as dots are eaten, ghost AI roaming). The specifics that
+> made that work, including the failure modes that cost hours, are baked into the
+> references.
 
 ---
 
@@ -22,13 +32,25 @@ Motorola 68000 (`m68k-elf-gcc`), the VDP, and the Z80 + YM2612 + PSG sound path.
   emulator core…) using a repeatable 4-phase method: carve a *platform-clean
   core*, build it on the host as an oracle, map each original subsystem to its
   Genesis equivalent, then bring it up on hardware incrementally.
-- **Debug a black-screen / crashing ROM** with a 7-cause triage checklist.
+- **Stand up a toolchain anywhere** — Docker, MarsDev, or (for restricted
+  sandboxes with no Docker and no time to compile GCC) Ubuntu's
+  `gcc-m68k-linux-gnu` plus a cloned SGDK, including building the library and Z80
+  tools from source and a full **manual build pipeline** for when you can't drive
+  `makefile.gen` directly.
+- **Debug a black-screen / crashing / *frozen* ROM** with an 8-cause triage —
+  including the subtle "renders but sprites/logic frozen, RAM writes dead"
+  failure and its root cause (a library/compiler **LTO-version mismatch**).
+- **Debug on target without a debugger** — visual-probe techniques (state-to-tile
+  markers, a RAM-persistence probe, the font-palette-index-15 invisibility trap)
+  and an "official-sample control test" that instantly separates *your bug* from
+  *your build environment's bug*.
 - **Convert assets** (tiles, sprite sheets, VGM/XGM music, S3M/MOD trackers, WAV
   samples) through `rescomp` and the `.res` pipeline.
 - **Set up sound** — XGM2 / XGM drivers, PCM SFX, and the tracker→VGM→XGM route.
 - **Test a ROM** with a two-tier harness: a host-compiled logic *oracle* plus a
-  **headless emulator** (Genesis Plus GX via libretro) that asserts rendered
-  frames are lit, colourful, and change over time.
+  **headless emulator** (Genesis Plus GX via libretro) that boots the real ROM,
+  feeds scripted input, and asserts rendered frames are lit, colourful, and
+  change over time.
 
 ## Definition of done
 
@@ -44,15 +66,18 @@ scratch build dir.
 ```
 sega-genesis-sgdk/
 ├── SKILL.md                  # entry point: workflow selector, build→verify loop,
-│                             #   black-screen triage, hard-constraints cheat-sheet
+│                             #   black-screen/frozen triage, constraints cheat-sheet
 ├── references/               # load on demand
-│   ├── toolchain-and-build.md   # install routes, GDK env, makefile.gen targets, CI
+│   ├── toolchain-and-build.md   # install routes (docker/marsdev/apt), GDK env,
+│   │                            #   makefile.gen targets, from-source libmd.a,
+│   │                            #   the LTO trap, the manual build pipeline, CI
 │   ├── api-and-engine.md        # program skeleton, VDP/planes, SPR_*, JOY_*, DMA_*,
 │   │                            #   MAP_*, SYS_*, memory model, SRAM, F16/F32
 │   ├── resources.md             # rescomp .res format + asset-conversion pipeline
 │   ├── audio.md                 # XGM2 vs XGM, VGM, WAV PCM, S3M/MOD→VGM→XGM
 │   ├── porting-workflow.md      # 4-phase method + system-mapping table
-│   ├── testing.md               # host oracle + headless Genesis Plus GX harness
+│   ├── testing.md               # host oracle + headless GPGX harness, on-target
+│   │                            #   visual probes, the official-sample control test
 │   └── examples.md              # ~50 real SGDK projects indexed by technique,
 │                                #   plus a 1.x→2.x API-rename table
 └── assets/                   # ready-to-adapt files
@@ -74,7 +99,8 @@ sega-genesis-sgdk/
 1. Read `SKILL.md` and pick a workflow (new game / port / debug).
 2. **Step 0**: ensure the toolchain exists (`assets/setup.sh`, or an existing
    `$GDK`), then scaffold from `assets/`.
-3. Build with the 2-line Makefile (`make` → `out/rom.bin`).
+3. Build with the 2-line Makefile (`make` → `out/rom.bin`), or the manual
+   pipeline when `makefile.gen` can't be driven directly.
 4. **Verify** with the test harness — never stop at "it compiled".
 5. Copy the ROM to an output path and hand it back.
 
@@ -87,8 +113,8 @@ Reference files are pulled in only when the task needs them, to keep context lea
 
 With the skill active, Claude will:
 
-1. **Set up the toolchain** — confirm `$GDK`, `m68k-elf-gcc`, and Java exist, or
-   run `assets/setup.sh` (docker, marsdev, or apt route) to set up SGDK.
+1. **Set up the toolchain** — confirm `$GDK`, a 68000 GCC, and Java exist, or run
+   `assets/setup.sh` (docker, marsdev, or apt route) to set up SGDK.
 2. **Scaffold the project** from `assets/` — a 2-line `Makefile`, `rom_header.c`,
    and a `main.c` with the `int main(bool hardReset)` entry and a fixed-step loop
    ending in `SYS_doVBlankProcess()`. Bounce logic goes in `src/core/` (portable,
@@ -103,8 +129,8 @@ With the skill active, Claude will:
 
 Other prompts it handles the same way: *"port this text-adventure C file to the
 Mega Drive"*, *"convert these PNG tiles and this .s3m into a scrolling
-background with music"*, or *"my SGDK build compiles but boots to a black
-screen — fix it"* (which jumps straight to the 7-cause triage).
+background with music"*, or *"my SGDK build compiles but boots to a black screen
+(or the sprites are frozen) — fix it"* (which jumps straight to the triage).
 
 ## Installing the skill
 
@@ -133,8 +159,8 @@ Testing (Tier 2) additionally builds **Genesis Plus GX**
 
 ## Provenance — verified vs adapted
 
-Facts in the references were checked against **cloned source**, not recalled from
-memory:
+Facts in the references were checked against **cloned source** and **a real
+build**, not recalled from memory:
 
 - **Verified against SGDK 2.12 + the `haroldo-ok` ports**: API names,
   `SYS_doVBlankProcess`, the `rescomp` `.res` format, `makefile.gen` targets, the
@@ -146,8 +172,7 @@ memory:
   `libmd.a` rebuild, the manual build pipeline, the Genesis Plus GX harness, and
   the on-target visual-probe / LTO-trap debugging techniques were all used to
   take an original maze-chase game from scratch to a **booting, playable
-  `out/rom.bin`** verified in Genesis Plus GX (sprites moving under joypad
-  control, score rising, ghost AI running). Those hard-won specifics live in
+  `out/rom.bin`** verified in Genesis Plus GX. Those hard-won specifics live in
   `references/toolchain-and-build.md` and `references/testing.md`.
 - **Adapted, run in that same effort**: `assets/tests/libretro_harness.c`
   compiles clean against the real `libretro.h` (`-Wall -Wextra`, zero warnings)
