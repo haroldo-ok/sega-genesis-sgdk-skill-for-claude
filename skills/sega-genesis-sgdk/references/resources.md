@@ -46,7 +46,9 @@ SPRITE  hero_sprite "sprite/hero.png" 4 4 FAST 5
 
 # music (XGM2 is the current driver) and a PCM sound effect
 XGM2    bgm_track   "music/level1.vgm"
-WAV     sfx_jump    "sfx/jump.wav" XGM2 6650      # driver then sample rate (Hz)
+WAV     sfx_jump    "sfx/jump.wav" XGM2           # out_rate: 13300 (default) or 6650 only
+                                                  # — any other value builds but plays at
+                                                  # the wrong pitch; see audio.md
 
 # raw data: a converted level, table, or save blob straight into ROM
 BIN     level1_data "data/level1.bin"
@@ -80,7 +82,17 @@ the bankswitch trampoline on >4 MB ROMs).
   Let rescomp/your converter own the mapping and verify against a reference.
 - Sprite frame `w h` are in **tiles** (×8 px). A 32×32 sprite is `4 4`. Hardware
   sprites max at 32×32; larger art becomes a multi-hardware-sprite metasprite,
-  which the engine handles but which costs sprite slots.
+  which the engine handles but which costs sprite slots. Past a certain size a
+  character is better drawn as **streamed background tiles** on a plane — see
+  `advanced-rendering.md` §4 (Punch-Out's boxers).
+- **Writing your own converter?** Pillow renumbers P-mode palettes on save and
+  drops unused entries, and `quantize()` may order padding colours arbitrarily —
+  assign source colours to fixed indexes yourself when the index layout matters.
+  Compress mostly-flat UI art (`BEST` rather than `NONE`) to let rescomp's tile
+  dedupe work: Tuxemon's HP plates went from 80 and 95 cells to 13 and 27
+  distinct tiles. More converter lessons (Tiled maps, data tables taken from
+  the shipped binary) in `porting-workflow.md` → "Lessons from the data-driven
+  ports".
 
 ## Using resources in C
 
@@ -92,7 +104,8 @@ VDP_drawImage(BG_A, &title_img, 0, 0);
 Map* m = MAP_create(&map_level, BG_A, TILE_ATTR_FULL(PAL0,0,0,0,0));
 Sprite* h = SPR_addSprite(&hero_sprite, 100, 100, TILE_ATTR(PAL1,0,0,0));
 XGM2_play(bgm_track);                                      // music resource is a u8[]
-XGM2_playPCM(sfx_jump, sizeof(sfx_jump), SOUND_PCM_CH1);   // WAV resource is a u8[]
+XGM2_playPCM(sfx_jump, sizeof(sfx_jump), SOUND_PCM_CH2);   // WAV resource is a u8[]
+                                     // (CH1 is usually the music's own PCM channel)
 const u8* raw = level1_data;                               // BIN → plain array
 ```
 

@@ -37,9 +37,16 @@ Motorola 68000, the VDP, and the Z80 + YM2612 + PSG sound path.
   `gcc-m68k-linux-gnu` plus a cloned SGDK, including building the library and Z80
   tools from source and a full **manual build pipeline** for when you can't drive
   `makefile.gen` directly.
-- **Debug a black-screen / crashing / *frozen* ROM** with an 8-cause triage —
+- **Debug a black-screen / crashing / *frozen* ROM** with a ten-entry triage —
   including the subtle "renders but sprites/logic frozen, RAM writes dead"
-  failure and its root cause (a library/compiler **LTO-version mismatch**).
+  failure (a library/compiler **LTO-version mismatch**), the black screen
+  *before* `main()` from SGDK's unchecked boot-time heap allocations, and GCC
+  code-gen traps that turn byte accesses into odd-address word accesses.
+- **Push the hardware** — the ~7 KB-per-VBlank DMA budget, tear-free double
+  buffering, software 3D (raycasters drawn into RAM in VDP tile format with
+  compiled scalers), big characters streamed onto a plane, and delta-encoded
+  FMV, drawn from complete ports of Catacomb Abyss, Catacomb 3-D and
+  Wolfenstein 3D.
 - **Debug on target without a debugger** — visual-probe techniques (state-to-tile
   markers, a RAM-persistence probe, the font-palette-index-15 invisibility trap)
   and an "official-sample control test" that instantly separates *your bug* from
@@ -49,8 +56,11 @@ Motorola 68000, the VDP, and the Z80 + YM2612 + PSG sound path.
 - **Set up sound** — XGM2 / XGM drivers, PCM SFX, and the tracker→VGM→XGM route.
 - **Test a ROM** with a two-tier harness: a host-compiled logic *oracle* plus a
   **headless emulator** (Genesis Plus GX via libretro) that boots the real ROM,
-  feeds scripted input, and asserts rendered frames are lit, colourful, and
-  change over time.
+  feeds scripted input on one or two pads (holds, button mashing), and asserts
+  rendered frames are lit, colourful, changing and not SGDK's crash screen;
+  measures audio energy to prove sound plays; dumps work RAM for post-mortems
+  (`ramsym.py` reads variables and the call stack back out); and checks the
+  cartridge header (`rom_sanity.py`). The templates pass both tiers unmodified.
 
 ## Definition of done
 
@@ -73,24 +83,35 @@ sega-genesis-sgdk/
 │   │                            #   the LTO trap, the manual build pipeline, CI
 │   ├── api-and-engine.md        # program skeleton, VDP/planes, SPR_*, JOY_*, DMA_*,
 │   │                            #   MAP_*, SYS_*, memory model, SRAM, F16/F32
+│   ├── advanced-rendering.md    # VBlank DMA budget, double buffering, raycasters,
+│   │                            #   big characters on planes, FMV, profiling
 │   ├── resources.md             # rescomp .res format + asset-conversion pipeline
-│   ├── audio.md                 # XGM2 vs XGM, VGM, WAV PCM, S3M/MOD→VGM→XGM
-│   ├── porting-workflow.md      # 4-phase method + system-mapping table
-│   ├── testing.md               # host oracle + headless GPGX harness, on-target
+│   ├── audio.md                 # XGM2 vs XGM, VGM, WAV PCM (the measured rate
+│   │                            #   rule), S3M/MOD→VGM→XGM, four more port routes
+│   ├── porting-workflow.md      # 4-phase method, system-mapping table, lessons
+│   │                            #   from the data-driven ports (RAM diet, tables
+│   │                            #   from the shipped binary, compiled scripts)
+│   ├── testing.md               # host oracle + headless GPGX harness and DSL,
+│   │                            #   crash/audio/header checks, RAM post-mortems,
 │   │                            #   visual probes, the official-sample control test
-│   └── examples.md              # ~50 real SGDK projects indexed by technique,
+│   └── examples.md              # ~55 real SGDK projects indexed by technique,
 │                                #   plus a 1.x→2.x API-rename table
 └── assets/                   # ready-to-adapt files
-    ├── Makefile                 # 2-line SGDK makefile template
-    ├── rom_header.c             # ROM header (incl. SRAM fields)
-    ├── main.c                   # minimal entry template (fixed-step loop, edge input)
+    ├── Makefile                 # makefile.gen + -fno-store-merging + 68000 libgcc
+    ├── rom_header.c             # ROM header (incl. SRAM fields, ROM-end note)
+    ├── main.c                   # entry template (fixed-step loop, edge input,
+    │                            #   a boot screen that passes the Tier-2 checks)
     ├── setup.sh                 # idempotent toolchain installer (docker/marsdev/apt)
     └── tests/
         ├── test_core_example.c        # host-oracle template (CHECK macro + shims)
         ├── run_host_tests.sh          # Tier-1 runner (compile + run core on host)
-        ├── libretro_harness.c         # headless emulator harness (dlopen GPGX core)
+        ├── libretro_harness.c         # headless emulator harness (dlopen GPGX core):
+        │                              #   holds, mash@, pad 2, shot@, ram@, audiostat@,
+        │                              #   HARNESS_WAV
         ├── run_headless_emulator_test.sh  # Tier-2 runner (build harness, run ROM)
-        ├── check_frames.py            # PPM frame assertions (lit / colourful / changed)
+        ├── check_frames.py            # lit / colourful / changed / not a crash screen
+        ├── rom_sanity.py              # header: ROM end vs size, checksums, SRAM
+        ├── ramsym.py                  # read symbols and the stack from a RAM dump
         └── run_all.sh                 # both tiers
 ```
 
@@ -99,7 +120,7 @@ sega-genesis-sgdk/
 1. Read `SKILL.md` and pick a workflow (new game / port / debug).
 2. **Step 0**: ensure the toolchain exists (`assets/setup.sh`, or an existing
    `$GDK`), then scaffold from `assets/`.
-3. Build with the 2-line Makefile (`make` → `out/rom.bin`), or the manual
+3. Build with the template Makefile (`make` → `out/rom.bin`), or the manual
    pipeline when `makefile.gen` can't be driven directly.
 4. **Verify** with the test harness — never stop at "it compiled".
 5. Copy the ROM to an output path and hand it back.
@@ -115,7 +136,7 @@ With the skill active, Claude will:
 
 1. **Set up the toolchain** — confirm `$GDK`, a 68000 GCC, and Java exist, or run
    `assets/setup.sh` (docker, marsdev, or apt route) to set up SGDK.
-2. **Scaffold the project** from `assets/` — a 2-line `Makefile`, `rom_header.c`,
+2. **Scaffold the project** from `assets/` — the template `Makefile`, `rom_header.c`,
    and a `main.c` with the `int main(bool hardReset)` entry and a fixed-step loop
    ending in `SYS_doVBlankProcess()`. Bounce logic goes in `src/core/` (portable,
    host-testable); the `SPR_*` and `JOY_*` glue goes in `src/platform/`.
@@ -165,7 +186,7 @@ build**, not recalled from memory:
 - **Verified against SGDK 2.12 + the `haroldo-ok` ports**: API names,
   `SYS_doVBlankProcess`, the `rescomp` `.res` format, `makefile.gen` targets, the
   project layout, and the `XGM2_play` signature.
-- **Community index** (`references/examples.md`): ~50 third-party repos
+- **Port and community index** (`references/examples.md`): ~55 repos
   categorized by technique, built from their live GitHub metadata/READMEs. The
   1.x→2.x rename table is distilled from the migration notes those repos ship.
 - **Battle-tested end-to-end**: the apt toolchain route, the from-source
@@ -174,15 +195,38 @@ build**, not recalled from memory:
   take an original maze-chase game from scratch to a **booting, playable
   `out/rom.bin`** verified in Genesis Plus GX. Those hard-won specifics live in
   `references/toolchain-and-build.md` and `references/testing.md`.
-- **Adapted, run in that same effort**: `assets/tests/libretro_harness.c`
-  compiles clean against the real `libretro.h` (`-Wall -Wextra`, zero warnings)
-  and drove the verified ROM's frame captures; still smoke-test it in your
-  environment the first time.
+- **Measured in the October 2026 revision** (SGDK 2.12, Ubuntu GCC 13.3, Genesis
+  Plus GX, each with a purpose-built test ROM or the ports' own ROMs):
+  - GCC **store merging** turns two adjacent `u8` writes into an odd-address
+    `move.w` (fixed by `-fno-store-merging`), and `(s16)(mem32 >> 8)` becomes an
+    odd-address `move.w x+1` at `-O1`…`-O3`; a plain inline helper does **not**
+    fix the latter, an `asm("" : "+d"(v))` barrier does;
+  - SGDK's **boot-time DMA allocations** fail silently with a big `.bss` — the
+    46/50/52/56 KB table in `toolchain-and-build.md`, and the fix verified after a
+    *clean* library rebuild (an incremental one silently kept the old `dma.o`);
+  - the **XGM2 PCM rate rule** (13300, or 6650 with `halfRate`; anything else
+    builds but plays at the wrong pitch) from FFT-measured captures;
+  - SGDK 2.x's **crash-screen** signature, the faulting-PC → function lookup,
+    Genesis Plus GX's **byte-swapped RAM** exposure, `sizebnd`'s **XOR checksum**
+    format, and the ROM-end header field across seven real ROMs;
+  - the `makefile.gen` variable semantics behind the template `Makefile`;
+  - `assets/setup.sh` (apt route) run end to end, and the template project
+    passing `run_all.sh` (both tiers) unmodified.
+- **Adapted, and exercised**: `assets/tests/libretro_harness.c` compiles clean
+  against the real `libretro.h` (`-Wall -Wextra`, zero warnings) and was run
+  against the Catacomb 3-D ROM (into gameplay via `mash@`, RAM dumps decoded,
+  WAV and audio energy checked) as well as the test ROMs above. Its new features
+  re-implement ideas from the Wolf3D, Punch-Out and Tuxemon ports' harnesses;
+  no code was copied from those GPL repositories.
 
 ## Credits
 
 - **SGDK** — Stéphane Dallongeville (`Stephane-D/SGDK`).
-- **Porting patterns & test-harness design** — the `haroldo-ok` SGDK ports.
+- **Porting patterns & test-harness design** — the `haroldo-ok` SGDK ports. The
+  games behind them belong to their owners: *Catacomb Abyss* / *Catacomb 3-D*
+  (Softdisk / id Software; source © Flat Rock Software, GPL v2),
+  *Wolfenstein 3D* (id Software), *Tuxemon* (the Tuxemon project, GPL-3.0),
+  *Punch-Out!! Pizza Tower Edition* (ScratchTac's fan game), *HexGL* (BKcore).
 - **Community examples** — the many third-party authors indexed in
   `references/examples.md` (radioation, makeclassicgames, bearmade, fabri1983,
   Anael Seghezzi, VagnoSilva, and others).

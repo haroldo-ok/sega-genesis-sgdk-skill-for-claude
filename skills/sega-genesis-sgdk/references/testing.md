@@ -44,32 +44,49 @@ is what proves "not a black screen" and "playable".
    make -C Genesis-Plus-GX -f Makefile.libretro platform=unix -j"$(nproc)"
    # -> genesis_plus_gx_libretro.so
    ```
-2. **Build the harness** (`assets/tests/libretro_harness.c`): a ~250-line C
-   program that `dlopen`s the core, runs N frames with scripted input, dumps
-   frames as PPM, and prints cartridge SRAM.
+2. **Build the harness** (`assets/tests/libretro_harness.c`): a ~380-line C
+   program that `dlopen`s the core, runs N frames with scripted input on one or
+   two pads, and records frames (PPM), work-RAM dumps, audio energy, an
+   optional WAV, and cartridge SRAM. It needs `libretro.h` (from the GPGX
+   checkout, or point `LIBRETRO_INC` at a directory holding it).
    ```sh
    cc -O2 -o harness tests/libretro_harness.c \
       -I Genesis-Plus-GX/libretro/libretro-common/include -ldl -lm
    ```
-3. **Build the ROM** and run it through the harness.
+3. **Build the ROM**, run `rom_sanity.py` on it, and run it through the harness.
+
+The whole runner, templates included, has been run end to end against SGDK 2.12
+on the apt toolchain (the template project passes both tiers unmodified).
 
 ### The input-script DSL
 
 The harness takes: `harness CORE.so ROM.bin TOTAL_FRAMES SCRIPT OUT_PREFIX`.
-`SCRIPT` is comma-separated directives:
+`SCRIPT` is comma-separated directives (frames count from 0):
 
 ```
-120-160:start       hold START over frames 120..160
-220-700:right       hold RIGHT over frames 220..700
-420-424:b           tap B briefly
-shot@110            write OUT_PREFIX110.ppm (a framebuffer snapshot)
+120-160:start           hold START over frames 120..160
+220-700:right           hold RIGHT over frames 220..700
+420-424:b               tap B briefly
+300-360:p2.left         hold LEFT on controller 2 (two-player / twin-stick)
+mash@400-600:10:a+b     alternate A and B, each held for half of a 10-frame
+                        period (get-up mashing, menu skipping, "press anything")
+shot@110                write OUT_PREFIX110.ppm (a framebuffer snapshot)
+ram@110                 write OUT_PREFIX110.ram (64 KB of 68000 work RAM)
+audiostat@110           print "audiostat@110 samples=N avg_energy=E": the mean
+                        |sample| since the previous audiostat (or boot)
 ```
 
-Buttons: `up down left right a b c start`. So a title→play smoke test:
+Buttons: `up down left right a b c start`, optionally prefixed `p2.`. Set
+`HARNESS_WAV=out.wav` to also save everything the console played (16-bit
+stereo at the core's rate). A title→play smoke test:
 
 ```sh
 harness gpgx.so out/rom.bin 300 "shot@30,120-160:start,200-260:right,shot@250" frames_
 ```
+
+Tested on a commercial-scale ROM (the Catacomb 3-D port): `mash@400-600:10:a+b`
+got from the title into level 1, `ram@` dumps decoded, the WAV came out at
+15.02 s for 900 frames, and audio energy went 0 → 389 when the music started.
 
 ### Assertions on the dumped frames
 
@@ -82,6 +99,71 @@ Read the PPMs and check, in a few lines of Python:
   palette-never-loaded, where everything maps to index 0 = black).
 - **Point-to-point**: after the START+Right script, the player/camera moved —
   compare a HUD/region crop between checkpoints.
+- **Not a crash screen.** SGDK 2.x's default exception handlers reinitialise the
+  VDP and print a register dump. Captured from a real address error under
+  Genesis Plus GX it is exactly four colours: black (~78%), cyan labels
+  `(168,236,232)` (~18%), white values, and a yellow title line `(232,204,0)`
+  ("ADDRESS ERROR", "BUS ERROR", ...). `check_frames.py` keys on that
+  cyan+yellow pair — a "mostly black, few colours" rule would also fire on
+  ordinary text screens (Catacomb's intro text is 89% black, 2 colours). The
+  dump's `Offset:` line is the faulting PC: `$5D4C` in the test ROM fell inside
+  `main.isra.0` per `out/release/symbol.txt`.
+- **Sound actually plays** (not merely links): bracket the frame that triggers a
+  sound with `audiostat@` checkpoints and assert the energy jumps (Tuxemon MD
+  sees near-zero while walking and 100–300× after a cry or menu confirm). For
+  pitch or speed, capture `HARNESS_WAV` and check duration and the FFT peak —
+  that is how the XGM2 rate rule in `audio.md` was measured.
+- **Cadence**, for streamed video/animation: snapshot every Nth frame and assert
+  each interval carries a new image (hexgl-fmv-md asserts 15/15 four-frame
+  intervals change at 15 fps).
+
+### Header checks (`rom_sanity.py`)
+
+`python3 tests/rom_sanity.py out/rom.bin [--strict]` reads the cartridge header:
+console name, **declared ROM end vs actual file size**, the checksum, and the
+SRAM fields. The checksum comes in two formats and the script reports both:
+SGDK's (what `sizebnd -checksum` writes and `SYS_isChecksumOk()` checks — XOR of
+all 32-bit words with the field zeroed, folded to 16 bits) and the classic Sega
+16-bit word sum from `$200` (what emulators display, so they'll usually call an
+SGDK ROM's checksum "bad"; harmless). Of seven real ROMs checked, six declared a
+ROM end larger than the file (the template's `$0FFFFF`/`$3FFFFF`), which most
+emulators ignore — Tuxemon MD traced an ILLEGAL INSTRUCTION crash to it and now
+fails its test on any mismatch; use `--strict` for the same.
+
+### Post-mortems from RAM dumps (`ramsym.py`)
+
+A `ram@N` dump plus the ELF answers "what was the game doing" without a
+debugger:
+
+```sh
+python3 tests/ramsym.py frames_250.ram out/release/symbol.txt score:4 lives:1
+python3 tests/ramsym.py frames_250.ram out/release/rom.out --stack   # return addrs
+```
+
+Genesis Plus GX exposes work RAM **byte-swapped per 16-bit word** (a high-score
+name "Sir Lancelot" reads `iS raLcnleto` raw); `ramsym.py` swaps it back
+(`--raw` to skip). Typical uses: confirm `main()` was reached at all (store a
+magic value as the first statement), read `MEM_getFree()` and DMA buffer
+pointers for the boot-heap problem, read the state machine's current state,
+and scan the stack for the call chain of a hang.
+
+**Prefer RAM reads to debug-HUD text for exact state.** On-screen debug
+readouts only update when the code that draws them runs: Tuxemon MD found its
+HUD frozen mid-transition because a per-frame VM flipped the state machine
+before the drawing case executed, which looked like a bug that wasn't there.
+Read values from a frame where the game is in a stable state, or from RAM.
+
+### Deeper: CPU registers and a cycle profiler
+
+Wolf3D MD extends this harness with two optional, core-specific tricks. (1)
+**68000 registers per snapshot**: `m68k_get_reg` is a local symbol in the GPGX
+`.so`, so its address is computed as `dlsym("retro_run")` minus `retro_run`'s
+`nm` address plus `m68k_get_reg`'s, then PC/SR/A7/D0/A0 are printed at each
+shot — enough to see where a hang spins. (2) A **cycle profiler**: a patched
+core accumulates cycles per PC word into a global array, the harness dumps it,
+and a script maps addresses to functions (`nm`) and lines (`addr2line`). Both
+need a non-stripped core you build yourself; reach for them when the frame
+budget is the problem.
 
 ### On-target self-test via SRAM marker (optional, strong)
 
@@ -91,9 +173,11 @@ core's checks against the converted data and writes a marker to SRAM
 (e.g. bytes `'O','K',1`). The harness prints the first SRAM bytes; the wrapper
 greps for the marker.
 
-**SRAM interleave gotcha:** Genesis SRAM sits on **odd** addresses; Genesis Plus
-GX dumps it interleaved with `0xFF`. So a marker `4F 4B 01` may appear as
-`4F FF 4B FF 01`. Match both forms.
+**SRAM interleave gotcha:** Genesis SRAM usually sits on **odd** addresses, and
+Genesis Plus GX's save buffer then shows the data on odd offsets with `0xFF`
+between — the Catacomb 3-D ROM's SRAM printed `FF 43 FF 33 FF 44 ...`
+("C3D..."). So a marker `4F 4B 01` appears as `FF 4F FF 4B FF 01`. Match the
+plain and both interleaved forms.
 
 ## Wiring it up
 
@@ -107,9 +191,11 @@ fails, or the self-test marker is absent.
 
 Map the symptom back to SKILL.md's "Black-screen triage": all-black →
 palette/`SYS_doVBlankProcess`; frozen after title → blocking wait or logic-tick
-stall; garbage tiles → VRAM overflow / stale rescomp output; red error screen →
-address error (build `make debug`, read the dump, check ROM-array bounds and
-host-vs-target `sizeof`); **renders but sprites frozen / RAM writes dead** →
+stall; garbage tiles → VRAM overflow / stale rescomp output; black-and-cyan
+register dump → exception (read `Offset:`, look it up in `symbol.txt`, check
+odd-address loads/stores and ROM-array bounds); **black before `main()`** →
+boot-heap exhaustion (a `ram@` dump with a magic value written first thing in
+`main()` tells you); **renders but sprites frozen / RAM writes dead** →
 library/compiler LTO mismatch (see the SKILL triage entry and toolchain doc).
 
 ## Debugging on target without a debugger (visual probes)

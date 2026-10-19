@@ -55,6 +55,32 @@ or `VDP_setScreenWidth256()` (H32); NTSC is 224 lines.
 - `VDP_loadTileSet(const TileSet*, index, DMA)` — upload tiles to VRAM.
 - `VDP_setHorizontalScroll(plane, offset)` / `VDP_setVerticalScroll(...)` — plane
   scroll; per-line/per-tile scroll modes enable parallax and raster tricks.
+- **Check the VRAM tile budget at boot.** `TILE_USER_MAX_INDEX` is a runtime
+  value (it shrinks when `SPR_init()` reserves sprite VRAM), so a static layout
+  can silently overrun it and wrap uploads into plane/sprite memory. If you lay
+  out tile bases by hand, assert after `SPR_init()`:
+  ```c
+  #define TILE_TOP_USED (TILE_USER_INDEX + 896)      /* your highest tile + 1 */
+  if (TILE_TOP_USED > TILE_USER_MAX_INDEX + 1)
+      SYS_die("VRAM tile budget exceeded", NULL);    /* string list ends in NULL */
+  ```
+- `TILE_SYSTEM_INDEX + n` (n = 0..15) are built-in **solid tiles of colour n**
+  that SGDK fills at boot — handy for bars, frames, fills and debug markers
+  without loading any art (the template `main.c` uses them).
+
+**Text and UI layering gotchas** (from Tuxemon MD's dialogue boxes):
+
+- The font's glyph background is **transparent**, so text on `BG_A` shows
+  whatever `BG_B` (or the backdrop) has between the strokes. Put a text box's
+  frame/fill on the plane *beneath* the text.
+- **Plane cells are not screen cells once a plane scrolls.** To draw a box at a
+  screen position on a scrolled 64-wide plane, offset by the scroll in cells and
+  wrap: `x_cell = (scroll_x / 8 + x) & 63` (likewise vertically with the plane
+  height). Reset the offset when a mode (e.g. battle) resets the scroll, or the
+  box appears where the camera *used* to be.
+- With every palette line spoken for, a UI can still get its own colours: the
+  font only ever uses **index 15** of the text palette, so indexes 1–14 of that
+  line are free for box and panel art.
 
 ## Palettes (colour)
 
@@ -70,6 +96,17 @@ Assign palette *lines* deliberately: e.g. PAL0 background, PAL1 player+FX, PAL2
 enemies, PAL3 NPCs/HUD — a common port strategy when squeezing a 256-colour
 source into 4×16 (frequency-weighted quantization, enforce min perceptual
 distance to avoid duplicate slots).
+
+Two budgeting moves that work when four lines aren't enough:
+
+- **Quantize per scene, not globally.** Tuxemon MD gives each map's NPCs (all
+  sharing one line) a palette quantized from *that map's* characters only and
+  reloads the line on map entry; quantizing all NPCs together washed every one
+  of them toward the same muddy colours.
+- **Reserve an index by quantizing to fewer colours.** Its battle backdrop is
+  quantized to 14 colours instead of 15 to free index 15 for a dark ink, so
+  text can be drawn on light HP plates by switching the text palette to that
+  line and back — "no fifth palette line invented".
 
 ## Sprite engine (`SPR_*`)
 
@@ -146,17 +183,25 @@ platformers/top-down levels. Feed it camera coordinates every frame.
 
 ## Memory model
 
-- **68 KB work RAM**, no `far` heap. SGDK provides `MEM_alloc/MEM_free`, but
-  prefer **static allocation** with known bounds; heap fragmentation on 68 KB
-  bites fast.
+- **64 KB of 68000 work RAM** (the Z80 has its own 8 KB), no `far` heap,
+  shared by `.data`/`.bss`, the stack (top of RAM, growing down), and SGDK's
+  heap (`MEM_alloc/MEM_free`). Prefer **static allocation** with known bounds;
+  heap fragmentation bites fast. SGDK itself takes ~9.5 KB of heap at reset
+  (DMA queue + 8 KB staging buffer) *before* `main()`, unchecked — a big
+  `.bss` makes that fail silently and the ROM hangs black or boots with NULL
+  DMA buffers; see `toolchain-and-build.md` → "Boot-time heap exhaustion".
+  `MEM_getFree()` at the top of `main()` tells you the margin.
 - **Keep big immutable data in ROM.** Levels, tables, dialogue, and converted
   assets belong in ROM as `BIN` resources or generated `const` arrays/`.inc`
   files — reference them in place, don't copy into RAM. A struct that is
   binary-compatible with the source format can be `memcpy`'d or even read
   directly from the ROM pointer.
-- **Watch `sizeof` differences** host vs target: 68000 `int` is 16-bit under
-  SGDK's flags in many idioms — prefer explicit `s8/u8/s16/u16/s32/u32` and
-  `F16/F32` fixed-point everywhere for portable, predictable layout.
+- **Watch `sizeof` and alignment differences** host vs target: `int` and
+  `long` are both 32-bit on m68k GCC (SGDK doesn't use `-mshort`), but 32-bit
+  values are only **2-byte aligned** on the 68000 ABI, so struct layouts differ
+  from a 4-byte-aligning host. Prefer explicit `s8/u8/s16/u16/s32/u32` and
+  `F16/F32` everywhere, and `_Static_assert` the sizes/offsets that a data
+  converter or save format depends on.
 
 ## SRAM saves (`SRAM_*`)
 
@@ -181,16 +226,32 @@ Use SGDK fixed-point in physics/geometry: `F16` is 10.6, `F32` is 16.16 (see
 FPU, and softfloat is huge and slow.
 
 > ⚠️ **Odd-address word-load trap with *custom* fixed-point.** If you roll your
-> own 8.8/16.16 in a 32-bit field and extract the integer part as
-> `(s16)(v >> 8)` where `v` is a **memory operand**, modern GCC (14+) can compile
-> that into a word load from an *odd* address — legal on 68020+, but an **address
-> error (crash)** on the base 68000. It runs fine in some emulators and traps on
-> accurate ones / real hardware, so it's easy to miss. Fix: force the shifted
-> value through a data register before the narrowing cast — e.g. a tiny
-> `static inline s16 fromfp(s32 v){ return (s16)(v >> 8); }` used everywhere
-> instead of the inline expression. (Verified from a real port that crashed until
-> it did this.) SGDK's own `F16/F32` helpers avoid the pattern; the trap is
-> specific to hand-rolled fixed-point on raw struct fields.
+> own 8.8 in a 32-bit field and extract the integer part as `(s16)(v >> 8)`
+> where `v` is a **memory operand**, GCC narrows the load to the middle two
+> bytes: a word read at an *odd* address — legal on 68020+, an **address error**
+> on the 68000. Reproduced on GCC **13.3** `-m68000` at `-O1`, `-O2` and `-O3`
+> (so a `make debug` build won't hide it, and not only GCC 14+):
+> `(s16)(o.x >> 8)` → `move.w o+1,%d0`. A plain helper does **not** fix it —
+> `static inline s16 fromfp(s32 v){ return (s16)(v >> 8); }` is inlined back into
+> the same `move.w o+1`. What works is an empty asm that forces the full long
+> into a data register first (the fix Llamatron MD uses):
+>
+> ```c
+> static inline s16 FROMFP(s32 v)
+> {
+>     __asm__("" : "+d"(v));      /* v must now live in a Dn: load stays 32-bit */
+>     return (s16)(v >> 8);
+> }
+> ```
+>
+> which compiles to `move.l o,%d0` / `asr.l #8,%d0`. Guard the asm with
+> `#ifndef HOST_BUILD` so the host oracle still builds. Extracting the *high*
+> word of a 16.16 value (`>> 16`) reads an even address and is safe; SGDK's own
+> `F16/F32` helpers avoid the pattern. It runs fine in lenient emulators and
+> traps on accurate ones and hardware, so test under Genesis Plus GX.
+>
+> The store-side cousin — adjacent `u8` writes merged into an odd word write —
+> is fixed by `-fno-store-merging` (see `toolchain-and-build.md`).
 
 ## Performance playbook
 

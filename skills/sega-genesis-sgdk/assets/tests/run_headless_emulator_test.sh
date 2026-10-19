@@ -17,23 +17,40 @@ if [[ ! -f "$CORE" ]]; then
   cp "$TMP/gpgx/genesis_plus_gx_libretro.so" "$CORE"
 fi
 
-# 2. Build the headless harness.
-cc -O2 -o "$TMP/harness" "$ROOT/tests/libretro_harness.c" \
-   -I"$TMP/gpgx/libretro/libretro-common/include" -ldl -lm
+# 2. Build the headless harness. It needs libretro.h: use LIBRETRO_INC if set,
+#    else the GPGX checkout (cloned here even when GPGX_CORE was supplied).
+LIBRETRO_INC="${LIBRETRO_INC:-$TMP/gpgx/libretro/libretro-common/include}"
+if [[ ! -f "$LIBRETRO_INC/libretro.h" ]]; then
+  [[ -d "$TMP/gpgx" ]] || git clone --depth 1 https://github.com/ekeeke/Genesis-Plus-GX.git "$TMP/gpgx"
+  LIBRETRO_INC="$TMP/gpgx/libretro/libretro-common/include"
+fi
+cc -O2 -o "$TMP/harness" "$ROOT/tests/libretro_harness.c" -I"$LIBRETRO_INC" -ldl -lm
 
 # 3. Build the ROM.
 make -C "$ROOT" clean >/dev/null
 make -C "$ROOT"
 test -f "$ROOT/out/rom.bin" || { echo "FAIL: out/rom.bin not produced"; exit 1; }
 
+# 3b. Static header checks (ROM-end vs file size, checksum, SRAM fields).
+#     Add --strict to fail on a ROM-end mismatch instead of warning.
+python3 "$ROOT/tests/rom_sanity.py" "$ROOT/out/rom.bin"
+
 # 4. Smoke playthrough: snapshot the title, press START, hold RIGHT, snapshot.
-#    Tune the frame ranges/buttons to your game's real states.
+#    Tune the frame ranges/buttons to your game's real states. Also dumps work
+#    RAM at the end (inspect with tests/ramsym.py) and prints audio energy at
+#    two checkpoints; add HARNESS_WAV=file.wav to keep what was played.
 "$TMP/harness" "$CORE" "$ROOT/out/rom.bin" 300 \
-  "shot@30,120-160:start,200-260:right,shot@250" \
+  "shot@30,audiostat@100,120-160:start,200-260:right,shot@250,ram@250,audiostat@250" \
   "$ART/frame_" | tee "$TMP/harness.out"
 
-# 5. Assert on the dumped frames: lit, colourful, and changed over time.
+# 5. Assert on the dumped frames: lit, colourful, changed over time, and not
+#    SGDK's exception (crash) screen.
 python3 "$ROOT/tests/check_frames.py" "$ART/frame_30.ppm" "$ART/frame_250.ppm"
+
+# 5b. (Optional) prove sound actually plays, not just links: assert the energy
+#     printed at a checkpoint after a sound-triggering input is far above a
+#     quiet one, e.g.
+#       grep -o 'audiostat@250.*avg_energy=[0-9.]*' "$TMP/harness.out"
 
 # 6. (Optional) on-target self-test marker in SRAM — see testing.md.
 #    Build with -DSELFTEST, run, and grep the printed SRAM head for your marker,

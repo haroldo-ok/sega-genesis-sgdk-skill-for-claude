@@ -121,8 +121,17 @@ Then build the library with your prefix, and put the m68k tools on PATH plus in
 ```sh
 export PATH=/opt/bin:$GDK/bin:$PATH
 for t in as ld nm ar objcopy ranlib; do ln -sf /opt/bin/m68k-elf-$t "$GDK/bin/$t"; done
+rm -rf "$GDK/out/release"                                  # always build clean
 cd "$GDK" && make -f makelib.gen PREFIX=m68k-elf- release   # -> lib/libmd.a
 ```
+
+**Always rebuild the library clean.** `makelib.gen` does not track header
+dependencies: after editing anything under `$GDK/inc` (e.g. the DMA defaults
+below), an incremental `make -f makelib.gen release` reports success and keeps
+the old objects — verified: `dma.o` kept a timestamp older than the `dma.h`
+edit and the behaviour didn't change until `out/release` was deleted.
+`assets/setup.sh` (apt route) does the tools, symlinks and a clean library
+build in one go, and has been run end to end against SGDK 2.12.
 
 `rescomp.jar`, `sizebnd.jar`, `xgmtool` are Java and work as-is. Docker/MarsDev
 images already have the library built with a matching compiler, which is why
@@ -139,7 +148,7 @@ GDK=/path/to/sgdk
 INCS="-Isrc -Iinc -Ires -Ibuild -I$GDK/inc -I$GDK/res -I$GDK/inc/snd"
 DF="-DSGDK_GCC -m68000 -Wall -Wextra -Wno-shift-negative-value -Wno-main \
     -Wno-unused-parameter -fno-builtin -ffunction-sections -fdata-sections -fms-extensions"
-CFLAGS="$INCS $DF -O3 -fno-web -fno-gcse -fomit-frame-pointer"
+CFLAGS="$INCS $DF -O3 -fno-web -fno-gcse -fomit-frame-pointer -fno-store-merging"
 AFLAGS="-x assembler-with-cpp -Wa,--register-prefix-optional,--bitwise-or $INCS $DF"
 
 # 1) resources: rescomp emits ASSEMBLY (.s), not an object. Assemble it after.
@@ -183,27 +192,39 @@ Non-obvious gotchas this sequence encodes:
 - The `AFLAGS` for `.s`/`.s80`-derived asm need
   `--register-prefix-optional,--bitwise-or` or SGDK's assembly won't assemble.
 
-## Building the SGDK library (only if you built/cloned SGDK yourself)
-
-Prebuilt Windows binaries include `libmd.a`. If you cloned SGDK on Linux you may
-need to build it once:
-
-```sh
-cd "$GDK"
-make -f makelib.gen   # produces lib/libmd.a and lib/libmd_debug.a
-```
-
-Docker/MarsDev images already have this done.
-
 ## The project Makefile
 
-An SGDK project Makefile is essentially two lines — it delegates everything to
-SGDK's `makefile.gen`, which discovers `src/**/*.c`, `res/**/*.res`, etc.:
+An SGDK project Makefile delegates everything to SGDK's `makefile.gen`, which
+discovers `src/**/*.c`, `res/**/*.res`, etc. The bare minimum is two lines
+(`GDK ?= /opt/sgdk` + `include $(GDK)/makefile.gen`), but use the form every
+Linux-built port in `examples.md` converged on — it's `assets/Makefile`:
 
 ```makefile
 GDK ?= /opt/sgdk
+override EXTRA_FLAGS += -fno-store-merging      # BEFORE the include
 include $(GDK)/makefile.gen
+LIBGCC := $(GDK)/lib/libgcc.a -Wl,--build-id=none   # AFTER the include
 ```
+
+Why each line sits where it does (checked against SGDK 2.12's `makefile.gen`
+and `common.mk`):
+
+- `makefile.gen` builds `DEFAULT_FLAGS := $(EXTRA_FLAGS) ...` with a
+  **simply-expanded** `:=`, so `EXTRA_FLAGS` set after the include is silently
+  ignored. `override ... +=` also survives `make EXTRA_FLAGS=-DFOO` on the
+  command line (verified: both flags reach the compile line).
+- **`-fno-store-merging`**: GCC merges adjacent byte stores into one word store.
+  On the 68000 a word access at an odd address is an address error. Reproduced
+  on Ubuntu's GCC 13.3 with `-O3 -m68000`: writing two `u8` fields at struct
+  offsets 11 and 12 compiled to `clr.w game+11` / `move.w #1793,11(%a0)`; with
+  the flag they stay two byte stores. Tuxemon MD hit exactly this in
+  `player_init`. Free insurance for every project.
+- `$(LIBGCC)` is only used inside the link recipe (expanded late), so assigning
+  it after the include works. On Linux `common.mk` defaults it to **`-lgcc`**,
+  which with `gcc-m68k-linux-gnu` is Debian's **68020+** libgcc (its
+  `__divsi3` traps on a 68000) — SGDK's `lib/libgcc.a` is the 68000 build.
+  `-Wl,--build-id=none` rides along in the same variable to stop the
+  Linux-target linker placing `.note.gnu.build-id` over the vector table.
 
 Build targets provided by `makefile.gen`:
 
@@ -214,15 +235,80 @@ Build targets provided by `makefile.gen`:
 | `asm`         | `-O3` without LTO, emits `.lst` assembly listings             |
 | `clean` / `clean-debug` / `clean-asm` | remove the matching `out/`           |
 
-Output always lands in **`out/<type>/`** with the final ROM at **`out/rom.bin`**.
-`out/rom.out` is the ELF (symbols, for debugger). `.lst`/`.map` help debugging.
+Output always lands in **`out/<type>/`** with the final ROM copied to
+**`out/rom.bin`**. In SGDK 2.12 the ELF is **`out/release/rom.out`** (or
+`out/debug/rom.out`) and `makefile.gen` also writes **`out/release/symbol.txt`**
+(`nm -n -l` output) — use either to map a crash PC or a RAM address to a name
+(`assets/tests/ramsym.py` reads both). `.lst`/`.map` help debugging.
+
+**Header dependencies are only partly tracked.** SGDK 2.12's `makefile.gen`
+writes a `.d` file per source into `out/<type>/_deps/` with
+`$(CC) -E -MG -MM -MP` and rebuilds when one of *your* headers changes
+(verified: editing only `inc/banner.h` changed the built ROM). Three gaps
+remain, each reproduced on 2.12: SGDK's own headers are included with `-isystem`, which `-MM` omits, so
+editing `$GDK/inc/*.h` doesn't rebuild your objects; each `.d` is regenerated
+only when its `.c` changes, so a header newly pulled in through *another*
+header isn't tracked until then; and SGDK's `makelib.gen` tracks no headers at
+all. Older SGDK was worse — Catacomb 3-D's README (SGDK 2.11) calls stale
+objects linked against an older `objtype` "a classic source of mysterious
+crashes". Rule: after changing a shared struct layout, or anything under
+`$GDK/inc`, `make clean`.
 
 Common overrides:
 
 - `make GDK=/path/to/sgdk` — point at a specific SGDK.
 - `make EXTRA_FLAGS=-DMY_DEFINE` — inject a compile define (used e.g. for
-  self-test builds; see `references/testing.md`).
+  self-test builds; see `references/testing.md`). With the template's
+  `override +=` line the store-merging flag is kept.
 - `PREFIX=m68k-elf-` — cross-tool prefix if yours differs.
+
+## Boot-time heap exhaustion (big `.bss` → black screen before `main()`)
+
+SGDK's reset code (`internal_reset()` → `DMA_init()`) allocates the **DMA queue
+(80 entries × 16 bytes) and an 8 KB DMA staging buffer** from the heap *before
+`main()` runs*, out of whatever RAM your `.data`/`.bss` and the stack leave.
+`DMA_initEx()` does not check `MEM_alloc()` for failure, so on a big game the
+pointers silently become NULL and later DMA traffic lands at address 0. The
+outcome depends on the exact layout, which makes it **non-monotonic** — measured
+on SGDK 2.12 defaults with one static array, read back from `ram@` dumps:
+
+| game array | reaches `main()` | DMA queue / buffer at `main()` |
+|---|---|---|
+| 46 KB | yes, ~4.9 KB heap left | both allocated |
+| 50 KB | **no** — black screen | — |
+| 52 KB | yes, draws text | queue OK, **buffer NULL** (latent crash) |
+| 56 KB | **no** — black screen | — |
+
+So "it booted" proves nothing near the limit. Probe it directly: at the top of
+`main()` store `MEM_getFree()` and `(u32)dmaDataBuffer` (declare
+`extern u16 *dmaDataBuffer;`) into globals, dump RAM with the harness's `ram@`
+directive, and read them with `ramsym.py`. Raycaster ports (~49 KB of `.bss`)
+all hit this.
+
+Fixes, in order of preference:
+
+1. **Shrink the boot allocations.** Edit `$GDK/inc/dma.h`
+   (`DMA_QUEUE_SIZE_DEFAULT`, `DMA_BUFFER_SIZE_NTSC`, `DMA_BUFFER_SIZE_PAL_LOW`)
+   and **clean**-rebuild `libmd.a`. In 2.12 the buffer is always clamped to at
+   least `DMA_BUFFER_SIZE_MIN` (2 KB); `DMA_QUEUE_SIZE_MIN` (32) applies only to
+   sizes passed explicitly to `DMA_initEx()`, not to the default.
+   Measured: with 32 entries + 2 KB, the 50 KB and 52 KB cases above both boot
+   with queue and buffer allocated (~7.7 / ~5.7 KB heap left); at 56 KB the game
+   simply doesn't fit in 64 KB any more. Catacomb 3-D ships this as
+   `tools/patch_sgdk.sh` (24 entries on SGDK 2.11) — its README then runs an
+   incremental `makelib.gen`; delete `$GDK/out/release` first or the patch
+   doesn't take.
+2. **Override the library function in your project** (no SGDK patch). Objects
+   in your project link before `libmd.a`, and an archive member is pulled in
+   only for symbols still undefined — so a project file that defines
+   *everything* `dma.o` exports replaces it. Wolf3D MD copies SGDK's `dma.c`
+   into `src/dma_override.c` with a 4-entry static queue and no staging buffer
+   (its view/status uploads are direct DMA from its own VInt), and does the same
+   for `vdp_tile.c`. Copy the **whole** module and keep it in sync with your SGDK
+   version: defining only some of its symbols pulls the original in as well and
+   fails with "multiple definition".
+3. **Need less RAM**: keep immutable data in ROM and shrink structs
+   (`porting-workflow.md` → memory diet).
 
 ## Source discovery rules (important gotchas)
 

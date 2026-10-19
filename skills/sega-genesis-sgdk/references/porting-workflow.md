@@ -31,7 +31,7 @@ port. God of Thunder's, as a model:
 | 256-colour 8-bit palette                  | 4 × 16-colour, 9-bit BGR palettes                  |
 | Planar mask-blitter (`xfput`)             | `SPR_addSprite` / `VDP_setTileMapXY` / DMA         |
 | Timer interrupt ~18 Hz                    | 60 fps VBlank, run logic every 3rd frame (≈20 Hz)  |
-| `far` heap (`farmalloc`)                  | 68 KB flat work RAM, static allocation             |
+| `far` heap (`farmalloc`)                  | 64 KB flat work RAM, static allocation             |
 | File I/O (`fopen`, `GAME.DAT`)            | ROM arrays / `BIN` resources                        |
 | Sound Blaster / AdLib / PC speaker        | YM2612 FM (XGM2) + PCM SFX                          |
 | Keyboard scan codes                       | 3-button joypad (`JOY_readJoypad`)                 |
@@ -47,14 +47,16 @@ Split the source into:
 - **`src/core/`** — pure logic: physics, collision, state machines, economy,
   AI, level/entity update. **No SGDK calls, no VDP/SPR/hardware.** Only
   `s8/u8/s16/u16/s32/u32` and `F16/F32` types (do a mechanical `int → s16`
-  pass; the 68000/SGDK idiom treats plain `int` as 16-bit in places, so make
-  widths explicit to avoid silent overflow and struct-size drift).
+  pass where the source relied on a 16-bit `int`: DOS compilers used 16-bit
+  `int`, but m68k GCC's `int` is **32-bit** — SGDK doesn't pass `-mshort` — so
+  wraparound, struct sizes and on-disk formats silently change unless widths
+  are explicit; and 32-bit arithmetic is slower on the 68000).
 - **`src/platform/`** — the SGDK shell that draws the core's state, reads input,
   plays sound, and persists saves.
 
 Trim the entity struct hard: remove embedded graphics buffers (the DOS
 `MASK_IMAGE pic[4][4]` etc.) and replace them with a `Sprite*` handle. God of
-Thunder cut its ACTOR struct from ~256 to ~100 bytes this way — on 68 KB RAM
+Thunder cut its ACTOR struct from ~256 to ~100 bytes this way — on 64 KB RAM
 that matters.
 
 Where the source has function-pointer dispatch tables (movement patterns, AI
@@ -116,6 +118,97 @@ adding the next. A reliable order:
   mostly replacing a text parser / mouse UI with a **joypad-driven menu** in
   40-column VDP text mode — little to no graphics conversion, so it's the
   easiest genre to start with. Watch RAM for large data tables (put them in ROM).
+  For 80-column DOS text screens, Catacomb Abyss draws a 4×8 code-page-437 font
+  so 80 columns fill the 320-pixel screen.
+
+## Lessons from the data-driven ports
+
+From `catacomb-abbyss-md`, `catacomb-3d-md`, `wolf-3d-md`, `tuxemon-md` and
+`punch-out-pizza-tower-edition-md` (see `examples.md`) — ports that convert the
+**original game data** rather than redrawing it.
+
+**Convert, don't hand-port, the data.** Each has a `tools/convert.py` (or
+several converters) that reads the retail/shareware files and emits
+`src/gen/*.c`, `.s` and `res/` inputs; `make data` regenerates them, and the
+generated files are checked in so a plain `make` works without the originals.
+Write the converter in Python with `-I` isolation, keep it re-runnable, and make
+it fail loudly on anything unexpected (Tuxemon's sprite converter *skips with an
+error* any sheet that isn't the expected 48×128 instead of silently mis-slicing).
+
+**Take tables from the shipped binary, not the source release.** Catacomb 3-D's
+Huffman dictionaries in the GPL source's `.OBJ` files came from a later (1993)
+build and didn't match the v1.00 data. The converter instead LZEXE-decompresses
+`CAT3D.EXE`, locates each table by content search, and **validates it by
+decoding real chunks** before trusting it. Whenever a source release and the
+data you're converting disagree, the binary that shipped with the data wins.
+
+**Put the data on a RAM diet.** 64 KB holds the game state, not the game. The
+Catacomb 3-D recipe, ending at 49 KB `.bss` with no runtime allocation after boot:
+- keep only **mutable** state in RAM; read immutable map planes straight from ROM
+  (an opened door is detected as "wall cell whose `actorat` entry is no longer
+  solid" instead of keeping a second 4 KB `tilemap`);
+- replace per-tile scratch arrays with computation (the 4 KB `spotvis`
+  visibility map became a Bresenham line-of-sight test per actor);
+- shrink hot structs (a 56-byte actor, hit-rects computed where used);
+- intern strings to small integer ids at conversion time (Tuxemon's 324 story
+  keys → indexes into a flat `u8 story_vars[324]`, a 355-byte save).
+Re-check every index type when you shrink: Catacomb 3-D's `0x80 + index` actor
+marker overflowed a byte at 128 actors.
+
+**Removing a table can expose a hidden writer.** After `tilemap` was removed,
+the renderer's old `spotvis` marking (a write 4,096 bytes past a pointer) landed
+inside the object list and corrupted `objtype.state` — crashes on levels 4 and
+6 only. When you delete or shrink a buffer, grep for code that wrote to it by
+offset, not by name.
+
+**Keep the original's clock.** Run the source's tick rate (70 Hz for id games)
+from a VBlank accumulator and keep its adaptive-tics logic, so gameplay speed
+matches the original on NTSC and PAL even when the frame rate doesn't
+(`advanced-rendering.md` §3).
+
+**Fix the original's real bugs deliberately, and say so.** Catacomb 3-D's
+100,000-point goal overflowed the DOS game's 16-bit score and *subtracted*
+points; the port uses a 32-bit counter. Document each such change under
+"Differences from the original".
+
+**Compile scripted behaviour to bytecode; fail safe.** Tuxemon's Tiled maps
+carry event objects with ordered `cond*`/`act*` properties. Rather than
+hand-porting 140 events, `tools/compile_events.py` emits condition/action
+bytecode with every string pre-interned, and the ROM runs one interpreter
+(condition evaluation lives in the host-testable core). The rules that made it
+trustworthy:
+- an unsupported **condition** compiles to "never true", so content the port
+  can't evaluate stays locked instead of firing early; an unsupported
+  **action** compiles to a no-op;
+- an event with *no* conditions is not "always true" — check every gating
+  namespace (Tuxemon's `behav*` properties hid real gates; the naive reading
+  made one event shadow every later event on the map, and a later variant made
+  an NPC greet on every step);
+- the compiler **prints what it skipped**;
+- actions that wait (dialogue, `wait`, scripted movement) need a resumable
+  per-frame VM (`event_vm_pump()`) rather than running a whole action list in
+  one call; reset the VM and any control lock on every map change and load.
+
+**Porting from Scratch.** Punch-Out Pizza Tower Edition starts by decompiling
+the project's `project.json` into readable pseudo-code
+(`tools/decompile_scratch.py` → `docs/original_scripts/*.txt`) and transcribes
+the opponent AI into C from that, keeping the original HP/damage tables; SVG
+costumes are rasterized with `cairosvg` before quantizing.
+
+**Porting from Tiled maps** (`tuxemon-md`'s `tools/convert_map.py`): decode the
+base64+zlib layers, resolve GIDs through both external `.tsx` and embedded
+tilesets, **alpha-composite all layers per cell** (taking the top layer left
+trees floating on black), dedupe and quantize to 15 colours + transparent,
+read collision rectangles from the object layer into a solid bitmap, and read
+event objects for encounters, doors (`transition_teleport` → trigger rect +
+destination) and spawn points. A 16×16 Tiled tile maps 1:1 to a 2×2 metatile.
+
+**PIL palette pitfalls in converters.** Pillow renumbers a P-mode palette on save
+and drops entries no pixel uses, and `quantize()` can return padding entries
+in arbitrary order. When palette *indexes* matter (UI art sharing the text
+palette, index 15 reserved for the font), map source colours to fixed slots
+yourself and set run-time-only colours with `PAL_setColor()` instead of baking
+them into the PNG.
 
 ## Definition of done
 

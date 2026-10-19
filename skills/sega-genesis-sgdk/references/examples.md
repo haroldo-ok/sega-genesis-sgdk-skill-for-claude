@@ -32,6 +32,14 @@ All at `https://github.com/haroldo-ok/<name>`.
   `jazz-jackrabbit-for-sega-genesis`, `god-of-thunder-genesis`. Streaming maps,
   entity pools, converted original assets, host + emulator tests.
 - **Pseudo-3D / effects (hard — performance-critical):** `fzero-clone-md`.
+- **First-person raycasters from original data (hard — RAM- and DMA-critical):**
+  `catacomb-abbyss-md` (start here: the renderer and VBlank DMA queue the other
+  two build on), `catacomb-3d-md`, `wolf-3d-md`.
+- **RPG driven by the original engine's data (hard — data pipeline):**
+  `tuxemon-md` — Tiled maps, YAML databases, compiled event scripts.
+- **Arcade fighter ported from Scratch (medium-hard):**
+  `punch-out-pizza-tower-edition-md` — big characters on a plane, an original
+  68000-driven FM soundtrack.
 - **Streaming FMV (hard — DMA-budget-critical):** `hexgl-fmv-md` — video-as-
   gameplay with a headless capture pipeline.
 - **Audio tooling:** `convert-s3m-vgm-jazzjackrabbit-md`.
@@ -110,6 +118,112 @@ there's a headless capture→convert→encode pipeline plus the two-tier test
 harness. Full write-up in Part 2 → *FMV / video*; **non-commercial** asset
 licensing caveat noted there.
 
+### `catacomb-abbyss-md` — the raycaster reference (Softdisk, 1992)
+A complete port of *The Catacomb Abyss* shareware v1.13 — all 19 levels, the
+INTRO/DEMOCAT/START/LOADSCN front-end programs, help text, debug keys, AdLib and
+PC-speaker effects — built with SGDK 2.11 from the GPL source and converted from
+the original files. It is the base the other two id-engine ports build on. Study:
+- the **renderer**: a 320×120 view as 160 two-pixel columns in a 4bpp RAM buffer
+  laid out as **column-major VDP tiles**; an assembly DDA casting every 4th
+  column and refining where the wall face changes; **compiled 68000 scalers**
+  generated from the original `BuildCompScale()` (byte and word variants); a
+  column z-buffer for sprites; 11–14 fps;
+- the **video layer** (`src/vid.c`): a VInt-driven DMA job ring (48 jobs, 7,000
+  bytes per VBlank, long jobs split across VBlanks, the page flip queued as a
+  job), Z80 bus protection around DMA, its own sprite table, dirty tracking per
+  8-px column, and a **page flip by one vertical-scroll write** on a 64×64 plane
+  that holds both buffers;
+- a **custom VRAM layout** (both planes at one address, sprite and H-scroll
+  tables moved) to fit two 600-tile view buffers plus the status bar;
+- APLIB-packed EGA screens, an 80-column 4×8 CP437 font for the DOS text
+  shells, `-DPROFILE` scanline timing HUD, `-DSTART_LEVEL=n`;
+- a Makefile that links SGDK's `libgcc.a` with `--build-id=none`, so a
+  Linux-hosted `m68k-linux-gnu` GCC works.
+Pairs with `references/advanced-rendering.md`. Needs the shareware data files to
+regenerate assets (generated sources are checked in).
+
+### `catacomb-3d-md` — the same engine, retail data, and the RAM diet
+*Catacomb 3-D: The Descent* (id/Softdisk 1991–92), complete: 20 levels, the id
+control panel with **Skull 'n' Bones**, 3 named SRAM save slots (RLEW-compressed
+map planes + actor list, ~10 KB of 32 KB), high scores, debug keys. A 264×144
+view (132 two-pixel columns) adapted from the Abyss renderer, with game logic
+ported from the Catacomb 3-D sources. The lessons worth stealing are in its
+README and now in this skill:
+- **boot-time heap exhaustion**: its ~49 KB `.bss` left too little heap for
+  SGDK's reset-time DMA allocations, a black screen before `main()` —
+  `tools/patch_sgdk.sh` shrinks the DMA defaults (`toolchain-and-build.md`);
+- **fitting id's data in 64 KB**: immutable map planes read from ROM, the 4 KB
+  `spotvis` replaced by a line-of-sight test, a 56-byte actor
+  (`porting-workflow.md` → RAM diet), and the two bugs that diet exposed;
+- **tables from `CAT3D.EXE`, not the GPL `.OBJ`s** (they're from a later build),
+  located by content search and validated by decoding;
+- AdLib effects and the IMF music **rendered offline with Nuked-OPL3** to
+  13,300 Hz PCM for XGM2; the original's 70 Hz adaptive tics kept;
+- a deliberate fix of the original's 16-bit score overflow.
+Retail data required; the README is explicit that `data/orig/` and the built ROM
+are **not redistributable**.
+
+### `wolf-3d-md` — Wolfenstein 3D, and a better test harness
+Shareware Episode 1 (10 levels) with menus, help/end texts, 3 SRAM save slots and
+high scores in a 3 MB ROM, made with reference to the Abyss port. Rendering is a
+256×128 view (128 two-pixel rays) at ~6 fps. Notable:
+- **overriding SGDK library modules from the project** instead of patching SGDK:
+  `src/dma_override.c` is a full copy of SGDK's `dma.c` with a 4-entry static
+  queue and no staging buffer (the view and status bar go up by direct DMA from
+  the VInt), and `src/vdp_tile_override.c` does the same for `vdp_tile.c`;
+- music: the original **IMF data converted to YM2612 (5 FM channels) + PSG
+  tracks**; digitized effects as PCM; AdLib effects rendered offline;
+- **harness extensions** (`tools/`): work-RAM dumps per snapshot with
+  `ramsym.py` (peek symbols) and `stackdump.py` (find return addresses), 68000
+  register dumps via a local-symbol offset trick, WAV capture, and a **cycle
+  profiler** (`prof.sh` + `profrep.py`, per-function and per-line via
+  `addr2line`) on a patched Genesis Plus GX. This skill's harness and
+  `ramsym.py` adopt the first three ideas; see `testing.md`.
+Needs the shareware data files (archive.org) to regenerate; the shareware
+licence permits limited non-commercial redistribution as-is.
+
+### `tuxemon-md` — an RPG built from the original engine's data
+A vertical slice of the open-source monster-catching RPG *Tuxemon* (GPL-3.0):
+fifteen real Tiled maps joined by their real doors, 33 monsters and 136
+techniques extracted from the upstream YAML with the battle formulas
+(stats, damage, type chart, Gen III/IV capture, experience) transliterated to
+8.8 fixed point, 24 NPCs, real dialogue from the `.po` locale, 51 per-event
+sound effects, and SRAM saves. The README documents every pipeline step and
+every bug it caught — the most instructive long-form port write-up in this list:
+- `convert_map.py`: Tiled `.tmx` → composited, deduped, 15-colour tiles +
+  collision bitmap + encounter zones + door triggers;
+- **compiled event scripts** (`compile_events.py` → bytecode + interpreter +
+  a resumable per-frame VM), with fail-safe rules for unsupported conditions;
+- story variables **interned to integer ids** (324 keys → a 355-byte save);
+- per-map NPC palette quantization; text/UI on the plane beneath the text;
+  freeing palette index 15 for dark ink; the VRAM tile budget asserted at boot;
+- the Makefile flags that are load-bearing: **`-fno-store-merging`** (a merged
+  `party[5].in_use`/`party_count` write became an odd `move.w`) and the
+  `LIBGCC` override;
+- tests: 220 host-oracle checks; the headless run asserts frames, the absence of
+  a crash screen, the **header ROM-end field against the file size**, and
+  **audio energy** jumps after each sound trigger.
+Caveat: its SFX are declared `XGM2 8000`, which plays ~1.66× fast (see the
+rate rule in `audio.md`); otherwise a model to follow.
+
+### `punch-out-pizza-tower-edition-md` — a Scratch game, big sprites done as tiles
+A port of ScratchTac's *Punch-Out!! Pizza Tower Edition* fan game (Scratch) to a
+2.75 MB ROM: the full campaign, title defenses and Last Stand mode, opponent AI
+transcribed from the original Scratch scripts, SRAM auto-save. Study:
+- **porting from Scratch**: `tools/decompile_scratch.py` turns `project.json`
+  into readable pseudo-code (`docs/original_scripts/`), the reference the AI was
+  transcribed from; SVG costumes rasterized with `cairosvg`;
+- **opponents streamed onto plane A** in two VRAM banks over several VBlanks,
+  within whatever DMA budget the sprites left (`DMA_setMaxTransferSize` +
+  `DMA_getQueueTransferSize`), switching the tilemap only when a frame is
+  complete; the player as two stacked sprites (`advanced-rendering.md` §4);
+- an **all-original soundtrack** from a small MML sequencer on the 68000 that
+  writes the YM2612 and PSG directly (`src/core/audio.c`, `audio.md` route 3);
+- harness additions: a `mash@` directive and WAV capture;
+  `make CHEATS=-DDEBUG_CHEATS` for instant knockouts and stage skips.
+**IP caveat:** the original is a fan game featuring third-party characters
+(Nintendo's, Sega's and Pizza Tower's); treat it as a technique reference only.
+
 ---
 
 # Part 2 — community index
@@ -179,6 +293,10 @@ technique references, not drop-in libraries.
   (older SGDK 1.62); run-and-gun sprite/animation reference.
 
 ### Raycasting & pseudo-3D (performance-critical)
+- `haroldo-ok/catacomb-abbyss-md`, `catacomb-3d-md`, `wolf-3d-md` — three
+  **complete commercial-game raycaster ports** from original data, with full
+  front ends, saves and sound (Part 1). Start with Abyss for the renderer and
+  DMA design; read Catacomb 3-D for fitting a big game into 64 KB.
 - `anael-seghezzi/SGDK_raycasting` — the well-known **raycaster** for Genesis;
   the canonical starting point for a first-person 3D view on 68000.
 - `fabri1983/raycasting_anael` — an **optimized 320×192 60 Hz** rework of Anael's
@@ -197,6 +315,9 @@ technique references, not drop-in libraries.
   iso rendering with racing feel.
 
 ### Text / RPG / narrative engines
+- `haroldo-ok/tuxemon-md` — an **overworld + turn-based battle RPG** built from
+  an existing engine's Tiled maps, YAML data and event scripts (compiled to
+  bytecode), with the most detailed pipeline write-up in this list (Part 1).
 - `haroldo-ok/choice4genesis` — a **ChoiceScript-style transpiler** (JS) that
   emits SGDK C for choose-your-own-adventure / visual-novel games. Use when the
   deliverable is branching text/slideshow rather than an action game.

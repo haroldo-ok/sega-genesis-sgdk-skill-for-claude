@@ -28,8 +28,12 @@ how they do it:
   the best worked port), `text-elite-genesis` (pure-C engine port),
   `spacetrader-genesis-`, `jazz-jackrabbit-for-sega-genesis` (platformer +
   host/emulator tests), `fzero-clone-md` (affine road streaming),
-  `gemrush-genesis`, `xquest2-md`, `elifoot2-md`, and
-  `convert-s3m-vgm-jazzjackrabbit-md` (music pipeline).
+  `gemrush-genesis`, `xquest2-md`, `elifoot2-md`,
+  `convert-s3m-vgm-jazzjackrabbit-md` (music pipeline), `catacomb-abbyss-md` /
+  `catacomb-3d-md` / `wolf-3d-md` (id-engine raycasters from original data),
+  `tuxemon-md` (RPG from Tiled maps + YAML data, compiled event scripts),
+  `punch-out-pizza-tower-edition-md` (Scratch port, big characters on a plane,
+  68000-driven FM music), and `hexgl-fmv-md` (delta-encoded FMV gameplay).
 
 ## Definition of done (do not stop at "it compiled")
 
@@ -38,8 +42,10 @@ checklist and report each item:
 
 1. **It compiles** — `make` produces `out/rom.bin` with no errors, and rescomp
    compiled every `.res` (missing/renamed assets fail here).
-2. **It fits** — the ROM is a sane size, RAM (68 KB work RAM) isn't blown by
-   oversized static buffers, and big/immutable data lives in ROM, not RAM.
+2. **It fits** — the ROM is a sane size, RAM (64 KB of 68000 work RAM, shared
+   with the stack and SGDK's heap) isn't blown by oversized static buffers, and
+   big/immutable data lives in ROM, not RAM. `assets/tests/rom_sanity.py`
+   checks the header (ROM-end vs real size, checksum, SRAM fields).
 3. **It is not a black screen** — a headless emulator boots the real ROM and
    asserts rendered frames are lit and change over time (see
    `references/testing.md`). A compiling black screen is the default failure of
@@ -66,6 +72,10 @@ checklist and report each item:
 - **Optimizing / improving** an existing project → `references/api-and-engine.md`
   "Performance" section (fixed-point, DMA, sprite/tile budgets, logic-rate
   decoupling).
+- **Software 3D (raycasters), FMV, full-screen or big-character animation,
+  anything uploading kilobytes per frame** → **`references/advanced-rendering.md`**
+  (the ~7 KB-per-VBlank DMA budget, tear-free double buffering, RAM tile
+  buffers, compiled scalers, streaming large characters onto a plane).
 - **Debugging a black screen / crash** → "Black-screen triage" below and
   `references/testing.md`.
 
@@ -97,7 +107,8 @@ port testable on the host and keeps the 68000-facing shell small.
 
 ```
 mygame/
-├── Makefile              # 2 lines: GDK ?= /opt/sgdk  +  include $(GDK)/makefile.gen
+├── Makefile              # assets/Makefile: GDK, EXTRA_FLAGS (before the include),
+│                         #   include $(GDK)/makefile.gen, LIBGCC override (after)
 ├── src/
 │   ├── main.c            # int main(bool hardReset) — entry + game loop
 │   ├── rom_header.c      # const ROMHeader rom_header = {...}  (region, name, SRAM)
@@ -111,16 +122,22 @@ mygame/
 └── tests/                # host oracle + headless-emulator harness (assets/tests/)
 ```
 
-Templates for `Makefile`, `main.c`, and `rom_header.c` are in `assets/`.
-`rom_header.c` is special — it is excluded from the source wildcard and defines
-the cartridge header (region string `"JUE"`, ROM/RAM extents, SRAM enable).
+Templates for `Makefile`, `main.c`, and `rom_header.c` are in `assets/`; copied
+together with `assets/tests/` they build and pass both test tiers unmodified
+(verified with SGDK 2.12 on the apt toolchain). Use the template `Makefile`,
+not the bare 2-line form: it adds `-fno-store-merging` and links SGDK's
+68000-safe `libgcc.a` with `--build-id=none`, three fixes every Linux-built
+port in `examples.md` ended up needing. `rom_header.c` is special — it is
+excluded from the source wildcard and defines the cartridge header (region
+string `"JUE"`, ROM/RAM extents, SRAM enable).
 
 ## Build → verify loop
 
 ```sh
 make                 # release build → out/rom.bin   (rescomp runs automatically)
 make debug           # -O1 -ggdb, asserts, symbols (KDebug/KLog work in emulators)
-make clean           # wipe out/
+make clean           # wipe out/ — REQUIRED after editing any header (see below)
+python3 tests/rom_sanity.py out/rom.bin   # header: ROM end, checksum, SRAM
 bash tests/run_host_tests.sh              # fast: compile the core on host, assert logic
 bash tests/run_headless_emulator_test.sh  # boot rom.bin in Genesis Plus GX, assert pixels
 ```
@@ -128,6 +145,16 @@ bash tests/run_headless_emulator_test.sh  # boot rom.bin in Genesis Plus GX, ass
 `make` targets are `release` (default, `-O3 -flto`), `debug`, `asm`, and their
 `clean-*` variants. Always look at `out/rom.bin`'s presence and size after a
 build, and re-run rescomp-touching builds after changing any asset.
+**Header dependencies are only partly tracked.** SGDK 2.12's `makefile.gen`
+rebuilds after edits to *your* headers (verified), but not after edits to
+SGDK's headers (they're `-isystem`, excluded by its `-MM` dependency pass), and
+a header newly included *by another header* isn't tracked until the `.c` itself
+changes; SGDK 2.11 and older were worse, and `makelib.gen` (the library build)
+tracks nothing. So after changing a struct layout or anything under
+`$GDK/inc`: `make clean` (or `rm -rf $GDK/out/release` for the library) —
+stale objects built against an old layout produce "impossible" crashes.
+The linked ELF is `out/release/rom.out` and `makefile.gen` writes a symbol map
+to `out/release/symbol.txt` — what you need to turn a crash PC into a function.
 
 ## Hard constraints cheat-sheet
 
@@ -144,7 +171,17 @@ newcomer/port mistakes:
   `SPR_update()` once per frame.
 - **VRAM is 64 KB** shared by tiles, tilemaps, sprite patterns, and H-scroll
   tables. Budget tiles; deduplicate with rescomp; stream large maps with `MAP_*`.
-- **Work RAM is 68 KB.** No `far` heap. Prefer static allocation and **keep
+  The usable tile range ends at `TILE_USER_MAX_INDEX`, a *runtime* value that
+  drops once `SPR_init()` reserves sprite VRAM (one port measured ~1,004 free
+  user tiles after it vs ~1,424 before). Overrunning it silently wraps uploads
+  into plane/sprite memory and corrupts graphics far from the bug — compute your
+  highest tile index and halt at boot with a need-vs-have message if it exceeds
+  `TILE_USER_MAX_INDEX`.
+- **Per-frame DMA is ~7 KB** (SGDK's `DMA_TRANSFER_CAPACITY_NTSC` = 7,200 bytes
+  per VBlank; more on PAL). Anything streaming tiles every frame lives or dies
+  by this — see `references/advanced-rendering.md`.
+- **Work RAM is 64 KB** (plus a separate 8 KB the Z80 owns), shared by your
+  `.data`/`.bss`, the stack, and SGDK's heap. No `far` heap. Prefer static allocation and **keep
   large immutable data in ROM** (as `.res` `BIN`, generated `.inc`/arrays, or
   `MAP`/`IMAGE` resources) — never `memcpy` a whole level into RAM if you can
   read it from ROM.
@@ -169,21 +206,43 @@ When a ROM compiles but shows black (or a frozen title), check in this order
    iteration or the display engine and DMA queue never advance.
 3. **A blocking wait wedged the loop** — an infinite wait on input/audio, or a
    `while` with no `SYS_doVBlankProcess()`.
-4. **rescomp silently used stale/missing art** — a renamed PNG left an old
-   generated symbol; force `make clean` and rebuild.
+4. **Stale build products** — rescomp kept a renamed PNG's old symbol, or
+   objects survived a header edit the dependency tracking missed (SGDK headers,
+   newly nested includes, older SGDK); `make clean` and rebuild before
+   debugging anything else.
 5. **VRAM overflow / tile clobber** — tiles or sprite patterns overran a
    tilemap or the sprite engine's VRAM region; text/plane data got overwritten.
 6. **DMA queue overflow in one frame** — too many/too-large transfers queued;
    split across frames or raise the queue size.
-7. **Crash → red error screen or reset loop** — a bad pointer / odd-address
+7. **Crash → register-dump screen or reset loop** — a bad pointer / odd-address
    access, or a 68020+-only instruction on the 68000. Build `make debug` and read
-   the address-error dump. Two recurring, easy-to-miss causes: (a) **odd-address
-   word load** from a custom fixed-point read like `(s16)(mem32 >> 8)` — GCC 14+
-   emits a word load at an odd address, fine on 68020 but a crash on 68000; route
-   the value through a data register (a `fromfp()` inline). (b) **68020+ libgcc**
+   the address-error dump. Recurring, easy-to-miss causes: (a) **odd-address
+   word load** from a custom fixed-point read like `(s16)(mem32 >> 8)` — GCC
+   (13.3 and 14 alike) emits `move.w x+1`, fine on 68020 but a crash on 68000. A
+   plain inline helper does *not* help; force the long through a register with
+   `__asm__("" : "+d"(v));` before the shift (`references/api-and-engine.md`
+   → fixed-point). (b) **68020+ libgcc**
    — Debian's `-lgcc` `__divsi3` uses `bsr.l`, illegal on 68000; link SGDK's
-   shipped `lib/libgcc.a` instead. Also check ROM-array bounds and host-vs-target
-   `sizeof`.
+   shipped `lib/libgcc.a` instead. (c) **GCC store merging** — two adjacent
+   `u8` writes become one word write at an odd address (reproduced on GCC 13.3
+   `-O3 -m68000`: `clr.w game+11`); build with `-fno-store-merging` (the template
+   Makefile does). Also check ROM-array bounds and host-vs-target `sizeof`.
+   SGDK 2.x's crash screen is a black register dump (yellow title, cyan labels);
+   its `Offset:` line is the faulting PC — look it up in
+   `out/release/symbol.txt`. `check_frames.py` detects this screen.
+8. **Black before `main()` with a big `.bss`** — SGDK allocates its DMA queue
+   and 8 KB staging buffer from the heap *during reset*, without checking for
+   failure. Measured on SGDK 2.12 defaults: 46 KB of game arrays boots; at 50 KB
+   and 56 KB `main()` is never reached; at 52 KB it boots with a NULL DMA buffer
+   (a crash waiting to happen) — non-monotonic, so one lucky build proves
+   nothing. Probe with `MEM_getFree()` at the top of `main()` (read it from a
+   `ram@` dump). Fix: shrink the defaults in `$GDK/inc/dma.h` and **clean**-
+   rebuild `libmd.a`, or override `DMA_init` in your project — see
+   `references/toolchain-and-build.md` → "Boot-time heap exhaustion".
+9. **Header claims more ROM than exists** — SGDK's template declares ROM end
+   `$0FFFFF` regardless of size; usually ignored, but it has produced ILLEGAL
+   INSTRUCTION crashes on hardware/strict emulators. `rom_sanity.py` prints the
+   right value for `rom_header.c`.
 
 **Distinct failure — "renders but frozen, RAM writes dead":** the ROM boots and
 draws, *background* tiles even update, but **sprites never move and game state
@@ -206,8 +265,12 @@ it never changes on-screen, RAM writes aren't sticking.
   per-tile `VDP_setTileMapXY` in loops — build a row and blit it.
 - **Pool and cull entities**: activate only near-camera actors; bound per-frame
   work (e.g. scan one map column per frame) so the 68000 keeps 60 fps.
-- Precompute tables; hoist invariant work out of loops.
-- Ship `release` (`-O3 -flto`); profile with `SYS_getFPS()` in a debug HUD.
+- Precompute tables; hoist invariant work out of loops; for a per-pixel inner
+  loop (wall/sprite scaling) generate unrolled 68000 code per case ("compiled
+  scalers") rather than looping.
+- Ship `release` (`-O3 -flto`); profile with `SYS_getFPS()` /
+  `SYS_showFrameLoad()` in a debug HUD, or time stages in scanlines
+  (`references/advanced-rendering.md` §6).
 
 ## Bundled resources
 
@@ -223,14 +286,23 @@ it never changes on-screen, RAM writes aren't sticking.
 - `references/porting-workflow.md` — the core/shell split, the DOS/legacy→
   Genesis system-mapping table, timing/memory/I-O/palette/input/save patterns,
   and incremental bring-up order.
+- `references/advanced-rendering.md` — the VBlank DMA budget (SGDK-native cap
+  vs a custom VInt job ring), tear-free double buffering (two tile banks, or a
+  page flip by one vertical-scroll write), raycaster design (column-major RAM
+  tile buffer, compiled scalers, DDA), big characters on a plane, FMV, and
+  scanline profiling.
 - `references/testing.md` — the host-core oracle, the headless Genesis Plus GX
-  libretro harness, its input-script DSL, PPM frame assertions, and the SRAM
-  self-test marker (plus the odd-byte SRAM interleave gotcha).
-- `references/examples.md` — ~50 real SGDK projects categorized by technique: the
+  libretro harness and its script DSL (holds, `mash@`, `shot@`, `ram@`,
+  `audiostat@`, pad 2, WAV capture), frame assertions including crash-screen
+  detection, audio-energy assertions, RAM-dump post-mortems, the SRAM self-test
+  marker, and the official-sample control test.
+- `references/examples.md` — ~55 real SGDK projects categorized by technique: the
   large `haroldo-ok` ports plus a community index (raycasting/pseudo-3D, FMV,
   slope collision, scrolling taxonomy, variable-width fonts, Godot/Aseprite
   pipelines, shmups, roguelike, etc.), and a **1.x→2.x API-rename table** for
   making old samples compile. Mine the closest match before writing from scratch.
 - `assets/` — ready-to-adapt `Makefile`, `main.c`, `rom_header.c`, `setup.sh`,
-  and a `tests/` harness (`libretro_harness.c`, `run_host_tests.sh`,
-  `run_headless_emulator_test.sh`, `test_core_example.c`).
+  and a `tests/` kit: `libretro_harness.c`, `check_frames.py` (lit / colourful /
+  advancing / not a crash screen), `rom_sanity.py` (header checks), `ramsym.py`
+  (read variables and a crash stack out of a RAM dump), `run_host_tests.sh`,
+  `run_headless_emulator_test.sh`, `run_all.sh`, `test_core_example.c`.

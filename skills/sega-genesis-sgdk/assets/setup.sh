@@ -78,7 +78,7 @@ EOF
       default-jre-headless make
     echo ">> Creating m68k-elf-* symlinks SGDK expects…"
     mkdir -p /opt/bin
-    for t in gcc as ld objcopy nm ar ranlib objdump strip cpp; do
+    for t in gcc as ld objcopy nm ar ranlib objdump strip cpp size addr2line; do
       src="$(command -v m68k-linux-gnu-$t || true)"
       [ -n "$src" ] && ln -sf "$src" /opt/bin/m68k-elf-$t
     done
@@ -90,6 +90,10 @@ EOF
       ( cd "$GDK/tools/sjasm/src" && make && cp sjasm "$GDK/bin/sjasm" ) || true
       ( cd "$GDK/tools/bintos" && gcc -O2 -o bintos src/*.c && cp bintos "$GDK/bin/bintos" ) || true
       for t in as ld nm ar objcopy ranlib; do ln -sf /opt/bin/m68k-elf-$t "$GDK/bin/$t"; done
+      # Clean first: makelib.gen does not track header dependencies, so after
+      # any edit under $GDK/inc (e.g. shrinking the DMA defaults in dma.h) an
+      # incremental build silently keeps the old objects.
+      rm -rf "$GDK/out/release"
       ( cd "$GDK" && PATH="/opt/bin:$GDK/bin:$PATH" make -f makelib.gen PREFIX=m68k-elf- release )
       echo ">> libmd.a rebuilt with this compiler. Link WITH lto (no -fno-lto)."
     else
